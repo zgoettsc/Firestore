@@ -67,10 +67,12 @@ class StoreManager: NSObject, ObservableObject {
     static let shared = StoreManager()
     
     private var currentAppData: AppData?
-    private let firestore = Firestore.firestore()
+    private var firestoreListener: ListenerRegistration?
     
     func setAppData(_ appData: AppData) {
         currentAppData = appData
+        print("🚨 DEBUG: StoreManager appData set, starting subscription monitoring")
+        setupSubscriptionMonitoring()
     }
     
     private func getCurrentAppData() -> AppData? {
@@ -85,7 +87,6 @@ class StoreManager: NSObject, ObservableObject {
         }
         
         Purchases.shared.delegate = self
-        setupFirestoreListener()
     }
     
     func loadOfferings() {
@@ -106,67 +107,123 @@ class StoreManager: NSObject, ObservableObject {
         }
     }
     
-    // Setup Firestore listener for subscription changes
-    private func setupFirestoreListener() {
-        guard let authUser = Auth.auth().currentUser else { return }
-        
-        // Listen to the customer document created by the RevenueCat extension
-        firestore.collection("customers").document(authUser.uid)
-            .addSnapshotListener { [weak self] documentSnapshot, error in
-                if let error = error {
-                    print("Error listening to customer document: \(error)")
-                    return
-                }
-                
-                guard let document = documentSnapshot, document.exists,
-                      let data = document.data() else {
-                    print("Customer document doesn't exist yet")
-                    return
-                }
-                
-                self?.processFirestoreSubscriptionData(data)
-            }
+    // Setup comprehensive subscription monitoring
+    private func setupSubscriptionMonitoring() {
+        // Only listen to RevenueCat - it's the source of truth
+        setupRevenueCatListener()
+        print("🚨 StoreManager: Using RevenueCat as single source of truth")
     }
     
-    private func processFirestoreSubscriptionData(_ data: [String: Any]) {
-        // The RevenueCat extension stores entitlements in the customer document
-        guard let entitlements = data["entitlements"] as? [String: Any] else {
-            print("No entitlements found in customer document")
-            currentSubscriptionPlan = .none
-            hasActiveSubscription = false
-            updateAppDataSubscription(plan: .none)
-            return
+    private func setupRevenueCatListener() {
+        // Get current subscription status from RevenueCat
+        Purchases.shared.getCustomerInfo { [weak self] customerInfo, error in
+            if let error = error {
+                print("Error getting RevenueCat customer info: \(error.localizedDescription)")
+                return
+            }
+            
+            guard let customerInfo = customerInfo else { return }
+            
+            print("RevenueCat customer info: Active entitlements: \(customerInfo.entitlements.active.keys)")
+            
+            // Process the subscription data
+            self?.processRevenueCatData(customerInfo)
         }
+    }
+    
+    private func processRevenueCatData(_ customerInfo: CustomerInfo) {
+        print("🚨 Processing RevenueCat entitlements")
+        print("🚨 Active entitlements: \(customerInfo.entitlements.active.keys)")
+        print("🚨 All entitlements: \(customerInfo.entitlements.all.keys)")
         
-        // Check for active entitlements
         var activePlan: SubscriptionPlan = .none
+        var mostRecentDate: Date?
+        var mostRecentAction = "none"
         
-        for (entitlementId, entitlementData) in entitlements {
-            guard let entitlement = entitlementData as? [String: Any],
-                  let isActive = entitlement["is_active"] as? Bool,
-                  isActive else { continue }
+        // Check ALL entitlements (active and inactive) to find the most recent event
+        for (entitlementId, entitlement) in customerInfo.entitlements.all {
+            print("🚨 Checking entitlement: \(entitlementId)")
+            print("🚨   isActive: \(entitlement.isActive)")
+            print("🚨   latestPurchaseDate: \(entitlement.latestPurchaseDate)")
+            print("🚨   expirationDate: \(entitlement.expirationDate?.description ?? "none")")
             
             // Map entitlement IDs to subscription plans
+            let plan: SubscriptionPlan
             switch entitlementId {
-            case "5_room_access": activePlan = .plan5Rooms
-            case "4_room_access": activePlan = .plan4Rooms
-            case "3_room_access": activePlan = .plan3Rooms
-            case "2_room_access": activePlan = .plan2Rooms
-            case "1_room_access": activePlan = .plan1Room
-            default: continue
+            case "5_room_access": plan = .plan5Rooms
+            case "4_room_access": plan = .plan4Rooms
+            case "3_room_access": plan = .plan3Rooms
+            case "2_room_access": plan = .plan2Rooms
+            case "1_room_access": plan = .plan1Room
+            default:
+                print("🚨   Unknown entitlement: \(entitlementId)")
+                continue
             }
             
-            // Use the highest tier plan if multiple are active
-            if activePlan.roomLimit > currentSubscriptionPlan.roomLimit {
-                break
+            if entitlement.isActive {
+                // Active subscription - use purchase date (if available)
+                guard let entitlementDate = entitlement.latestPurchaseDate else {
+                    print("🚨   Skipping active entitlement with no purchase date: \(entitlementId)")
+                    continue
+                }
+                
+                if let currentMostRecent = mostRecentDate {
+                    if entitlementDate > currentMostRecent {
+                        mostRecentDate = entitlementDate
+                        activePlan = plan
+                        mostRecentAction = "purchased/renewed"
+                        print("🚨   New most recent ACTIVE plan: \(plan.displayName) (purchased: \(entitlementDate))")
+                    }
+                } else {
+                    // No previous date, so this purchase is the most recent
+                    mostRecentDate = entitlementDate
+                    activePlan = plan
+                    mostRecentAction = "purchased/renewed"
+                    print("🚨   New most recent ACTIVE plan: \(plan.displayName) (purchased: \(entitlementDate))")
+                }
+            } else if let expirationDate = entitlement.expirationDate {
+                // Inactive/expired subscription - use expiration date as cancellation date
+                if let currentMostRecent = mostRecentDate {
+                    if expirationDate > currentMostRecent {
+                        mostRecentDate = expirationDate
+                        activePlan = .none // Cancellation means no active plan
+                        mostRecentAction = "cancelled/expired"
+                        print("🚨   New most recent CANCELLATION: \(plan.displayName) (expired: \(expirationDate))")
+                    }
+                } else {
+                    // No previous date, so this expiration is the most recent
+                    mostRecentDate = expirationDate
+                    activePlan = .none
+                    mostRecentAction = "cancelled/expired"
+                    print("🚨   New most recent CANCELLATION: \(plan.displayName) (expired: \(expirationDate))")
+                }
             }
         }
         
-        let wasActive = hasActiveSubscription
-        currentSubscriptionPlan = activePlan
-        hasActiveSubscription = activePlan != .none
+        print("🚨 Final result: \(activePlan.displayName)")
+        print("🚨 Most recent action: \(mostRecentAction) on \(mostRecentDate?.description ?? "none")")
         
-        print("Updated subscription from Firestore: \(activePlan.displayName)")
+        // Update subscription immediately
+        updateSubscription(to: activePlan)
+    }
+    
+    private func setupFirestoreListener() {
+        // DISABLED: Firestore listener causes conflicts with RevenueCat
+        // RevenueCat is the single source of truth for subscription status
+        print("🚨 Firestore listener disabled - using RevenueCat as single source of truth")
+    }
+    
+    // REMOVED: processFirestoreSubscriptionData - no longer needed since we use RevenueCat as single source of truth
+    
+    private func updateSubscription(to plan: SubscriptionPlan) {
+        let wasActive = hasActiveSubscription
+        
+        DispatchQueue.main.async {
+            self.currentSubscriptionPlan = plan
+            self.hasActiveSubscription = plan != .none
+            
+            print("🚨 StoreManager: Updated subscription to \(plan.displayName), active: \(self.hasActiveSubscription)")
+        }
         
         // Handle subscription changes
         if wasActive && !hasActiveSubscription {
@@ -175,53 +232,80 @@ class StoreManager: NSObject, ObservableObject {
             clearGracePeriod()
         }
         
-        updateAppDataSubscription(plan: activePlan)
+        // Update app data and Firebase Realtime Database
+        updateAppDataSubscription(plan: plan)
     }
     
     private func updateAppDataSubscription(plan: SubscriptionPlan) {
         guard let appData = getCurrentAppData(),
-              let currentUser = appData.currentUser else { return }
+              let currentUser = appData.currentUser else {
+            print("🚨 ERROR: No app data or current user available for subscription update")
+            return
+        }
         
-        // Update Firebase Realtime Database
-        let dbRef = Database.database().reference()
         let userId = currentUser.id.uuidString
         
+        print("🚨 DEBUG: Starting subscription update")
+        print("  - Current plan in AppData: \(currentUser.subscriptionPlan ?? "nil")")
+        print("  - Current limit in AppData: \(currentUser.roomLimit)")
+        print("  - New plan: \(plan.rawValue)")
+        print("  - New limit: \(plan.roomLimit)")
+        
+        // Update local app state FIRST for immediate UI response
+        DispatchQueue.main.async {
+            var updatedUser = currentUser
+            updatedUser.subscriptionPlan = plan.rawValue
+            updatedUser.roomLimit = plan.roomLimit
+            appData.currentUser = updatedUser
+            appData.objectWillChange.send()
+            
+            print("🚨 IMMEDIATE: Updated AppData user subscription to \(plan.displayName)")
+            print("🚨 IMMEDIATE: AppData now shows plan: \(updatedUser.subscriptionPlan ?? "nil"), limit: \(updatedUser.roomLimit)")
+            
+            // Post immediate notification
+            NotificationCenter.default.post(
+                name: Notification.Name("SubscriptionUpdated"),
+                object: nil,
+                userInfo: [
+                    "plan": plan.rawValue,
+                    "limit": plan.roomLimit,
+                    "userIdString": userId
+                ]
+            )
+            
+            print("🚨 IMMEDIATE: Posted SubscriptionUpdated notification")
+        }
+        
+        // Then update Firebase as a backup
+        let dbRef = Database.database().reference()
         let updates: [String: Any] = [
             "subscriptionPlan": plan.rawValue,
             "roomLimit": plan.roomLimit
         ]
         
+        print("🚨 FIREBASE: Updating Realtime Database for user \(userId): \(updates)")
+        
         dbRef.child("users").child(userId).updateChildValues(updates) { error, _ in
             if let error = error {
-                print("Error updating subscription in Realtime Database: \(error)")
-            } else {
-                print("Successfully updated subscription in Realtime Database")
+                print("🚨 ERROR: Failed to update Firebase: \(error)")
                 
                 DispatchQueue.main.async {
-                    // Update local app state
-                    var updatedUser = currentUser
-                    updatedUser.subscriptionPlan = plan.rawValue
-                    updatedUser.roomLimit = plan.roomLimit
-                    appData.currentUser = updatedUser
-                    
-                    // Notify views
                     NotificationCenter.default.post(
-                        name: Notification.Name("SubscriptionUpdated"),
+                        name: Notification.Name("SubscriptionUpdateFailed"),
                         object: nil,
-                        userInfo: [
-                            "plan": plan.rawValue,
-                            "limit": plan.roomLimit,
-                            "userIdString": userId
-                        ]
+                        userInfo: ["error": error.localizedDescription]
                     )
                 }
+            } else {
+                print("🚨 FIREBASE: Successfully updated subscription in Realtime Database")
             }
         }
     }
     
     func checkSubscriptionStatus() {
-        // With the Firebase extension, we rely on the Firestore listener
-        // But we can still manually check RevenueCat if needed
+        print("🚨 Manual subscription status check")
+        
+        // Check RevenueCat first
         Purchases.shared.getCustomerInfo { [weak self] customerInfo, error in
             if let error = error {
                 print("Error getting customer info: \(error.localizedDescription)")
@@ -230,8 +314,8 @@ class StoreManager: NSObject, ObservableObject {
             
             guard let customerInfo = customerInfo else { return }
             
-            // The extension will handle updating Firestore, but we can log here
             print("Manual check - Active entitlements: \(customerInfo.entitlements.active.keys)")
+            self?.processRevenueCatData(customerInfo)
         }
     }
     
@@ -262,9 +346,13 @@ class StoreManager: NSObject, ObservableObject {
                     return
                 }
                 
-                // Success - the Firebase extension will automatically update Firestore
-                // and our listener will pick up the changes
-                print("Purchase successful - waiting for Firebase extension to sync data")
+                print("Purchase successful - processing subscription update")
+                
+                // Process the updated customer info immediately
+                if let customerInfo = customerInfo {
+                    self?.processRevenueCatData(customerInfo)
+                }
+                
                 completion(true, nil)
             }
         }
@@ -432,8 +520,9 @@ class StoreManager: NSObject, ObservableObject {
                     return
                 }
                 
-                if customerInfo != nil {
-                    // The Firebase extension will handle updating Firestore
+                if let customerInfo = customerInfo {
+                    // Process the restored subscription data
+                    self?.processRevenueCatData(customerInfo)
                     completion(true, nil)
                 } else {
                     completion(false, "No purchases to restore")
@@ -448,6 +537,10 @@ class StoreManager: NSObject, ObservableObject {
         }
     }
     
+    deinit {
+        firestoreListener?.remove()
+    }
+    
     // MARK: - Debug Testing Methods
     
 #if DEBUG
@@ -458,6 +551,8 @@ class StoreManager: NSObject, ObservableObject {
             print("  - subscriptionGracePeriodEnd: \(String(describing: appData.subscriptionGracePeriodEnd))")
             print("  - current user: \(appData.currentUser?.name ?? "nil")")
             print("  - owned rooms: \(appData.currentUser?.ownedRooms?.count ?? 0)")
+            print("  - subscription plan: \(appData.currentUser?.subscriptionPlan ?? "nil")")
+            print("  - room limit: \(appData.currentUser?.roomLimit ?? 0)")
         } else {
             print("🚨 DEBUG: No AppData available")
         }
@@ -474,23 +569,12 @@ class StoreManager: NSObject, ObservableObject {
     
     func simulateCancellation() {
         print("🚨 DEBUG: Simulating subscription cancellation")
-        let wasActive = hasActiveSubscription
-        
-        hasActiveSubscription = false
-        currentSubscriptionPlan = .none
-        
-        if wasActive && !hasActiveSubscription {
-            handleSubscriptionCancellation()
-        }
+        updateSubscription(to: .none)
     }
     
     func simulateReactivation() {
         print("🚨 DEBUG: Simulating subscription reactivation")
-        hasActiveSubscription = true
-        currentSubscriptionPlan = .plan1Room
-        
-        clearGracePeriod()
-        updateAppDataSubscription(plan: currentSubscriptionPlan)
+        updateSubscription(to: .plan1Room)
     }
 #endif
 }
@@ -498,8 +582,10 @@ class StoreManager: NSObject, ObservableObject {
 // MARK: - PurchasesDelegate
 extension StoreManager: PurchasesDelegate {
     func purchases(_ purchases: Purchases, receivedUpdated customerInfo: CustomerInfo) {
-        print("RevenueCat delegate: Customer info updated")
-        // The Firebase extension will handle the data sync automatically
-        // We just log that we received the update
+        print("🚨 RevenueCat delegate: Customer info updated")
+        print("Active entitlements: \(customerInfo.entitlements.active.keys)")
+        
+        // Process the updated customer info immediately
+        processRevenueCatData(customerInfo)
     }
 }
